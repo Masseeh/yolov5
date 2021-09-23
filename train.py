@@ -60,9 +60,18 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           device,
           callbacks
           ):
+
+    if opt.patience != 0:
+        opt.epochs = 10000
+
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze, = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
+
+    if opt.val_per > epochs:
+        opt.val_per = 1
+        
+    test_env = opt.test_env
 
     # Directories
     w = save_dir / 'weights'  # weights dir
@@ -436,7 +445,7 @@ def parse_opt(known=False):
     parser.add_argument('--hyp', type=str, default='data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
+    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=32, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
@@ -451,13 +460,14 @@ def parse_opt(known=False):
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
+    parser.add_argument('--workers', type=int, default=3, help='maximum number of dataloader workers')
     parser.add_argument('--project', default='runs/train', help='save to project/name')
     parser.add_argument('--entity', default=None, help='W&B entity')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
+    parser.add_argument('--one-cycle', action='store_true', help='OneCycleLR')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--upload_dataset', action='store_true', help='Upload dataset as W&B artifact table')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
@@ -466,6 +476,10 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--freeze', type=int, default=0, help='Number of layers to freeze. backbone=10, all=24')
     parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
+    parser.add_argument('--test_env', type=int, default=0)
+    parser.add_argument('--ds_seed', type=int, default=0)
+    parser.add_argument('--oe-ratio', type=int, default=0)
+    parser.add_argument('--leave_out', action='store_true', help='leave-one-domain-out strategy')
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
@@ -506,15 +520,19 @@ def main(opt, callbacks=Callbacks()):
         device = torch.device('cuda', LOCAL_RANK)
         dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
 
-    # Train
-    if not opt.evolve:
-        train(opt.hyp, opt, device, callbacks)
-        if WORLD_SIZE > 1 and RANK == 0:
-            LOGGER.info('Destroying process group... ')
-            dist.destroy_process_group()
+    # Train leave-one-domain-out 
+    if opt.leave_out:
+        for test_env in range(7): 
+            opt1 = deepcopy(opt)
+            opt1.test_env = test_env
+            opt1.save_dir += f'_{test_env}'
+
+            train(opt1.hyp, opt1, device)
+            if WORLD_SIZE > 1 and RANK == 0:
+                _ = [print('Destroying process group... ', end=''), dist.destroy_process_group(), print('Done.')]
 
     # Evolve hyperparameters (optional)
-    else:
+    elif opt.evolve:
         # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
         meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
                 'lrf': (1, 0.01, 1.0),  # final OneCycleLR learning rate (lr0 * lrf)
@@ -599,6 +617,11 @@ def main(opt, callbacks=Callbacks()):
         print(f'Hyperparameter evolution finished\n'
               f"Results saved to {colorstr('bold', save_dir)}\n"
               f'Use best hyperparameters example: $ python train.py --hyp {evolve_yaml}')
+    
+    else:
+        train(opt.hyp, opt, device)
+        if WORLD_SIZE > 1 and RANK == 0:
+            _ = [print('Destroying process group... ', end=''), dist.destroy_process_group(), print('Done.')] 
 
 
 def run(**kwargs):
