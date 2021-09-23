@@ -90,6 +90,23 @@ def exif_transpose(image):
             image.info["exif"] = exif.tobytes()
     return image
 
+def extract_imgs(path):
+        f = []  # image files
+        for p in path if isinstance(path, list) else [path]:
+            p = Path(p)  # os-agnostic
+            if p.is_dir():  # dir
+                f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                # f = list(p.rglob('**/*.*'))  # pathlib
+            elif p.is_file():  # file
+                with open(p, 'r') as t:
+                    t = t.read().strip().splitlines()
+                    parent = str(p.parent) + os.sep
+                    f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                    # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
+            else:
+                raise Exception(f'{p} does not exist')
+        return sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS])
+
 def split_dataset(root, test_env, holdout_fraction=0.2, seed=0, oe_ratio=5):
     root = Path(root)
 
@@ -640,14 +657,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
 
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        path = self.img_files[index]
+        if self.env_names:
+            env_idx = self.env_names[Path(path).parent.name]
+        else:
+            env_idx = -1
+
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes, env_idx
 
     @staticmethod
     def collate_fn(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
+        img, label, path, shapes, env_idx = zip(*batch)  # transposed
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes, env_idx
 
     @staticmethod
     def collate_fn4(batch):
