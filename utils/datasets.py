@@ -90,9 +90,60 @@ def exif_transpose(image):
             image.info["exif"] = exif.tobytes()
     return image
 
+def split_dataset(root, test_env, holdout_fraction=0.2, seed=0, oe_ratio=5):
+    root = Path(root)
 
-def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
-                      rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix=''):
+    in_splits = []
+    oe_splits = []
+    out_splits = []
+    test_splits = []
+    env_names = {}
+    env_i = -1
+
+    for env in sorted(root.iterdir()):
+        if not env.is_dir():
+            continue
+
+        if env.name == 'oe':
+            if oe_ratio == 0:
+                continue
+            
+            env_names[env.name] = -1
+            imgs = np.array(extract_imgs(env))
+            imgs.sort()
+            keys = list(range(len(imgs)))
+            np.random.RandomState(seed).shuffle(keys)
+            oe_size = int(oe_ratio * len(in_splits))
+            oe_splits.extend(imgs[keys[:oe_size]])
+            continue
+        
+        env_i += 1
+
+        env_names[env.name] = env_i
+        
+        imgs = np.array(extract_imgs(env))
+        imgs.sort()
+
+        if env_i == test_env:
+            test_splits.extend(imgs.tolist())
+            continue
+        
+        n = int(len(imgs)*holdout_fraction)
+
+        keys = list(range(len(imgs)))
+        np.random.RandomState(seed).shuffle(keys)
+        keys_1 = keys[:n]
+        keys_2 = keys[n:]
+
+        out, in_ = imgs[keys_1], imgs[keys_2]
+
+        in_splits.extend(in_.tolist())
+        out_splits.extend(out.tolist())
+    
+    return in_splits, out_splits, test_splits, oe_splits, env_names
+
+def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0, shuffle=True, env_names={},
+                      rect=False, rank=-1, workers=8, image_weights=False, quad=False, ds_seed=0, test_env=0, prefix=''):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -104,7 +155,10 @@ def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=Non
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)
+                                      prefix=prefix,
+                                      test_env=test_env,
+                                      ds_seed=ds_seed,
+                                      env_names=env_names)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, workers])  # number of workers
@@ -367,8 +421,8 @@ def img2label_paths(img_paths):
 class LoadImagesAndLabels(Dataset):  # for training/testing
     cache_version = 0.5  # dataset labels *.cache version
 
-    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+    def __init__(self, splits, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False, ds_seed=0, env_names={},
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, test_env=0, prefix=''):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -377,33 +431,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
-        self.path = path
         self.albumentations = Albumentations() if augment else None
+        self.img_files = splits
+        self.env_names = env_names
 
-        try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('**/*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p, 'r') as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
-            assert self.img_files, f'{prefix}No images found'
-        except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
+        if 'train' in prefix:
+            cache_prefix = f'train_{ds_seed}_{test_env}.cache'
+        elif 'val' in prefix:
+            cache_prefix = f'val_{ds_seed}_{test_env}.cache'
+        else:
+            cache_prefix = f'test_{ds_seed}_{test_env}.cache'
 
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        cache_path = (Path(self.label_files[0]).parent.parent)/cache_prefix
         try:
             cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
             assert cache['version'] == self.cache_version  # same version
