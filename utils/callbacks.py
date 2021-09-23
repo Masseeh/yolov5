@@ -32,8 +32,12 @@ class Callbacks:
         'on_model_save': [],
         'on_train_end': [],
 
-        'teardown': [],
+        'on_teardown': [],
     }
+
+    def reset(self):
+        for k, v in self._callbacks:
+            v = []
 
     def register_action(self, hook, name='', callback=None):
         """

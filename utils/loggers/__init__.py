@@ -5,7 +5,7 @@ Logging utils
 
 import warnings
 from threading import Thread
-
+from itertools import chain
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
@@ -23,7 +23,6 @@ try:
 except (ImportError, AssertionError):
     wandb = None
 
-
 class Loggers():
     # YOLOv5 Loggers class
     def __init__(self, save_dir=None, weights=None, opt=None, hyp=None, logger=None, include=LOGGERS):
@@ -33,10 +32,7 @@ class Loggers():
         self.hyp = hyp
         self.logger = logger  # for printing results to console
         self.include = include
-        self.keys = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
-                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',  # metrics
-                     'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
-                     'x/lr0', 'x/lr1', 'x/lr2']  # params
+
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
         self.csv = True  # always log to csv
@@ -63,6 +59,16 @@ class Loggers():
         else:
             self.wandb = None
 
+    def build_keys(self, env_names, test_env):
+        train_loss = ['train/box_loss', 'train/obj_loss', 'train/cls_loss']  # train loss
+        lr = ['x/lr0', 'x/lr1', 'x/lr2']  # params
+        val_loss = ['val/box_loss', 'val/obj_loss', 'val/cls_loss']  # val loss
+        metrics = ['metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95'] 
+        per_env_metrics = list(chain(*[[f'env_{v}/precision', f'env_{v}/recall', f'env_{v}/mAP_0.5', f'env_{v}/mAP_0.5:0.95'] for k, v in env_names.items() if (v != test_env and v != -1)]))
+        test_metrics = ['test/precision', 'test/recall', 'test/mAP_0.5', 'test/mAP_0.5:0.95']
+
+        self.keys = train_loss + per_env_metrics + metrics + val_loss + test_metrics + lr
+
     def on_pretrain_routine_end(self):
         # Callback runs on pre-train routine end
         paths = self.save_dir.glob('*labels*.jpg')  # training labels
@@ -76,7 +82,8 @@ class Loggers():
                 if not sync_bn:  # tb.add_graph() --sync known issue https://github.com/ultralytics/yolov5/issues/3754
                     with warnings.catch_warnings():
                         warnings.simplefilter('ignore')  # suppress jit trace warning
-                        self.tb.add_graph(torch.jit.trace(de_parallel(model), imgs[0:1], strict=False), [])
+                        if self.tb:
+                            self.tb.add_graph(torch.jit.trace(de_parallel(model), imgs[0:1], strict=False), [])
             if ni < 3:
                 f = self.save_dir / f'train_batch{ni}.jpg'  # filename
                 Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
@@ -102,6 +109,9 @@ class Loggers():
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
         # Callback runs at the end of each fit (train+val) epoch
+
+        assert len(self.keys) == len(vals)
+
         x = {k: v for k, v in zip(self.keys, vals)}  # dict
         if self.csv:
             file = self.save_dir / 'results.csv'
@@ -131,15 +141,16 @@ class Loggers():
         files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
         files = [(self.save_dir / f) for f in files if (self.save_dir / f).exists()]  # filter
 
-        if self.tb:
+        if self.tb and plots:
             import cv2
             for f in files:
                 self.tb.add_image(f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats='HWC')
 
         if self.wandb:
-            self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
+            if plots:
+                self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
             # Calling wandb.log. TODO: Refactor this into WandbLogger.log_model
-            if not self.opt.evolve:
+            elif not self.opt.evolve:
                 wandb.log_artifact(str(best if best.exists() else last), type='model',
                                    name='run_' + self.wandb.wandb_run.id + '_model',
                                    aliases=['latest', 'best', 'stripped'])
