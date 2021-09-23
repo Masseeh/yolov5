@@ -15,8 +15,24 @@ import torch
 def fitness(x):
     # Model fitness as a weighted combination of metrics
     w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
-    return (x[:, :4] * w).sum(1)
+    return (x* w).sum()
 
+def cal_map(stats, plots, save_dir, names, nc):
+
+    stats = [np.concatenate(x, 0) for x in zip(*stats)] # to numpy
+    
+    mp, mr, map50, map = 0.0, 0.0, 0.0, 0.0
+    p, r, ap, ap50, ap_class = [], [], [], [], []
+    
+    if len(stats) and stats[0].any():
+        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
+        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
+    else:
+        nt = torch.zeros(1)
+
+    return mp, mr, map50, map, p, r, ap, ap50, ap_class, nt
 
 def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=()):
     """ Compute the average precision, given the recall and precision curves.
