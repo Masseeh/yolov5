@@ -1,0 +1,24 @@
+# Parameters
+nc: 1  # number of classes
+depth_multiple: 1.0  # model depth multiple
+width_multiple: 1.0  # layer channel multiple
+anchors:
+  - [4,3,  6,5,  7,6,  6,7,  7,9,  9,8] 
+  - [5,3,  6,5,  7,5,  6,7,  8,7,  8,9]
+
+# YOLOv5 backbone
+backbone:
+  # [from, number, module, args]
+  [[-1, 1, Conv, [64, 3, 1]],
+   [-1, 1, Conv, [64, 3, 1]],
+   [-1, 1, Conv, [128, 3, 2]],  # /2
+   [-1, 3, C3, [128]], 
+   [-1, 1, Conv, [256, 3, 1]], 
+   [-1, 3, C3, [256]],
+  ]
+
+# YOLOv5 head
+head:
+  [
+   [[1, 5], 1, Detect, [nc, anchors]],  # Detect
+  ]

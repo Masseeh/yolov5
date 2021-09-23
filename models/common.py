@@ -136,6 +136,46 @@ class C3(nn.Module):
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
 
+######## RegNet Blocks ###############33
+
+class BottleneckTransform(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, g=1, s=1):  # ch_in, ch_out, groups, stride
+        super().__init__()
+        self.cv1 = Conv(c1, c2, 1, 1)
+        self.cv2 = Conv(c2, c2, 3, s, g=g)
+        self.cv3 = Conv(c2, c2, 1, 1, act=False)
+
+    def forward(self, x):
+        return self.cv3(self.cv2(self.cv1(x)))
+
+class BottleneckBlock(nn.Module):
+    def __init__(self, c1, c2, s=1, g=1, proj=True):
+        super().__init__()
+        
+        self.proj = Conv(c1, c2, 1, s, act=False) if proj else None
+        self.b = BottleneckTransform(c1, c2, g, s)
+        self.af = nn.SiLU()
+
+    def forward(self, x):
+        x_p = self.proj(x) if self.proj else x
+        return self.af(x_p + self.b(x))
+
+class C3Reg(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, g=1, s=1):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+
+        blocks = [BottleneckBlock(c1, c2, s=s, g=g)]
+        if n > 1:
+            blocks += [BottleneckBlock(c2, c2, s=1, g=g, proj=False) for _ in range(n-1)]
+
+        self.m = nn.Sequential(*blocks)
+
+    def forward(self, x):
+        return self.m(x)
+
+######## RegNet Blocks ###############33
 
 class C3TR(C3):
     # C3 module with TransformerBlock()
