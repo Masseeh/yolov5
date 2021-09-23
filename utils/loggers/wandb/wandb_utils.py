@@ -459,13 +459,14 @@ class WandbLogger():
 
         if len(self.bbox_media_panel_images) < self.max_imgs_to_log and self.current_epoch > 0:
             if self.current_epoch % self.bbox_interval == 0:
-                box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
+                h, w = im.shape[1:3]
+                box_data = [{"position": {"minX": xyxy[0]/w, "minY": xyxy[1]/h, "maxX": xyxy[2]/w, "maxY": xyxy[3]/h},
                              "class_id": int(cls),
                              "box_caption": "%s %.3f" % (names[cls], conf),
                              "scores": {"class_score": conf},
                              "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
                 boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
-                self.bbox_media_panel_images.append(wandb.Image(im, boxes=boxes, caption=path.name))
+                self.bbox_media_panel_images.append(wandb.Image(str(path), boxes=boxes, caption=path.name))
 
     def log(self, log_dict):
         """

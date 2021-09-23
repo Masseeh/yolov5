@@ -13,6 +13,7 @@ from utils.general import colorstr, emojis
 from utils.loggers.wandb.wandb_utils import WandbLogger
 from utils.plots import plot_images, plot_results
 from utils.torch_utils import de_parallel
+from utils.bbox_vis import BboxDrawerTb
 
 LOGGERS = ('csv', 'tb', 'wandb')  # text-file, TensorBoard, Weights & Biases
 
@@ -49,6 +50,7 @@ class Loggers():
             prefix = colorstr('TensorBoard: ')
             self.logger.info(f"{prefix}Start with 'tensorboard --logdir {s.parent}', view at http://localhost:6006/")
             self.tb = SummaryWriter(str(s))
+            self.tb_bbox = BboxDrawerTb(self.tb)
 
         # W&B
         if wandb and 'wandb' in self.include:
@@ -100,12 +102,19 @@ class Loggers():
         # Callback runs on val image end
         if self.wandb:
             self.wandb.val_one_image(pred, predn, path, names, im)
+        
+        if self.tb:
+            self.tb_bbox.val_one_image(pred, path, im)
 
-    def on_val_end(self):
+
+    def on_val_end(self, plots, epoch):
         # Callback runs on val end
-        if self.wandb:
+        if self.wandb and plots:
             files = sorted(self.save_dir.glob('val*.jpg'))
             self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
+        
+        if self.tb:
+            self.tb_bbox.draw(epoch)
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
         # Callback runs at the end of each fit (train+val) epoch
