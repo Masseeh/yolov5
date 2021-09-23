@@ -35,7 +35,7 @@ import val  # for end-of-epoch mAP
 from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader, split_dataset
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     strip_optimizer, get_latest_run, check_dataset, check_git_status, check_img_size, check_requirements, \
     check_file, check_yaml, check_suffix, print_args, print_mutation, set_logging, one_cycle, colorstr, methods
@@ -93,7 +93,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Loggers
     if RANK in [-1, 0]:
-        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)  # loggers instance
+        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER, include=opt.include)  # loggers instance
         if loggers.wandb:
             data_dict = loggers.wandb.data_dict
             if resume:
@@ -104,12 +104,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             callbacks.register_action(k, callback=getattr(loggers, k))
 
     # Config
-    plots = not evolve  # create plots
+    plots = False #not evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(1 + RANK)
+    init_seeds(opt.ds_seed)
     with torch_distributed_zero_first(RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
-    train_path, val_path = data_dict['train'], data_dict['val']
+        
+    train_path, val_path = data_dict.get('train'), data_dict.get('val')
+
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
@@ -168,9 +170,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Scheduler
     if opt.linear_lr:
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
-    else:
+    elif opt.one_cycle:
         lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    else: # nothing
+        lf = lambda x: 1
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  
+    # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
     ema = ModelEMA(model) if RANK in [-1, 0] else None
@@ -199,25 +204,38 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         del ckpt, csd
 
     # Image sizes
-    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+    gs = max(int(model.stride.max()), 2)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
-    imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+    imgsz = check_img_size(opt.imgsz, gs)  # verify imgsz is gs-multiple
 
     # DP mode
-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
-        logging.warning('DP not recommended, instead use torch.distributed.run for best DDP Multi-GPU results.\n'
-                        'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
-        model = torch.nn.DataParallel(model)
+    # if cuda and RANK == -1 and torch.cuda.device_count() > 1:
+    #     logging.warning('DP not recommended, instead use torch.distributed.run for best DDP Multi-GPU results.\n'
+    #                     'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
+    #     model = torch.nn.DataParallel(model)
 
     # SyncBatchNorm
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
 
+    # split 
+    in_splits, out_splits, test_splits, oe_splits, env_names = split_dataset(data_dict['path'], test_env=test_env, seed=opt.ds_seed, oe_ratio=opt.oe_ratio)
+
+    loggers.build_keys(env_names=env_names, test_env=test_env)
+
+    env_len = len(env_names) - 1 if 'oe' in env_names else len(env_names)
+    if test_env == -2:
+        env_len += 1
+
+    LOGGER.info(f'Train Size : {len(in_splits)} Valid Size : {len(out_splits)} Test Size: {len(test_splits)} OE Size: {len(oe_splits)}')
+    LOGGER.info(f'Envs: {env_names}')
+    LOGGER.info(f'Test Env Index: {test_env}')
+
     # Trainloader
-    train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
-                                              hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=RANK,
-                                              workers=workers, image_weights=opt.image_weights, quad=opt.quad,
+    train_loader, dataset = create_dataloader(in_splits + oe_splits, imgsz, batch_size // WORLD_SIZE, gs, single_cls, shuffle=True, env_names=env_names,
+                                              hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=RANK, ds_seed=opt.ds_seed,
+                                              workers=workers, image_weights=opt.image_weights, quad=opt.quad, test_env=test_env,
                                               prefix=colorstr('train: '))
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
@@ -225,10 +243,16 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Process 0
     if RANK in [-1, 0]:
-        val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
-                                       hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
-                                       workers=workers, pad=0.5,
-                                       prefix=colorstr('val: '))[0]
+        val_loader, _ = create_dataloader(out_splits, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls, env_names=env_names,
+                                       hyp=hyp, cache=None if noval else opt.cache, rect=False, rank=-1, shuffle=False,
+                                       workers=workers, pad=0.5, test_env=test_env, ds_seed=opt.ds_seed,
+                                       prefix=colorstr(f'val-{opt.test_env}: '))
+
+        if test_env != -2:
+            test_loader, _ = create_dataloader(test_splits, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls, env_names=env_names,
+                                        hyp=hyp, cache=None if noval else opt.cache, rect=False, rank=-1, shuffle=False,
+                                        workers=workers, pad=0.5, test_env=test_env, ds_seed=opt.ds_seed,
+                                        prefix=colorstr(f'test-{opt.test_env}: '))
 
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -256,16 +280,22 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
+    model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
     # Start training
     t0 = time.time()
-    nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    if hyp['warmup_epochs'] == 0:
+        nw = 0
+    else:
+        nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    results = (*(0, 0, 0, 0) * env_len , 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    test_results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     stopper = EarlyStopping(patience=opt.patience)
@@ -295,7 +325,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, paths, _, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -357,11 +387,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-            if not noval or final_epoch:  # Calculate mAP
+            if (not noval or final_epoch) and (epoch % opt.val_per == 0):  # Calculate mAP
                 results, maps, _ = val.run(data_dict,
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,
                                            model=ema.ema,
+                                           task='val',
                                            single_cls=single_cls,
                                            dataloader=val_loader,
                                            save_dir=save_dir,
@@ -369,13 +400,37 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            verbose=nc < 50 and final_epoch,
                                            plots=plots and final_epoch,
                                            callbacks=callbacks,
+                                           epoch=epoch,
+                                           env_names=env_names,
+                                           test_env=test_env,
                                            compute_loss=compute_loss)
 
+                if test_env != -2:
+                    test_results, _, _ = val.run(data_dict,
+                                            batch_size=batch_size // WORLD_SIZE * 2,
+                                            imgsz=imgsz,
+                                            conf_thres=0.25,
+                                            iou_thres=0.6,
+                                            task='test',
+                                            model=ema.ema,
+                                            single_cls=single_cls,
+                                            dataloader=test_loader,
+                                            save_dir=save_dir,
+                                            save_json=is_coco and final_epoch,
+                                            verbose=nc < 50 and final_epoch,
+                                            plots=plots and final_epoch,
+                                            callbacks=callbacks,
+                                            epoch=epoch,
+                                            env_names=env_names,
+                                            test_env=test_env,
+                                            compute_loss=compute_loss)
+
             # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            fi = fitness(np.array(results[-4]))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
+            
+            log_vals = list(mloss) + list(results) + list(test_results[:-3]) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
             # Save model
@@ -396,8 +451,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
             # Stop Single-GPU
-            if RANK == -1 and stopper(epoch=epoch, fitness=fi):
-                break
+            if ni > nw:
+                if RANK == -1 and stopper(epoch=epoch, fitness=fi):
+                    break
 
             # Stop DDP TODO: known issues shttps://github.com/ultralytics/yolov5/pull/4576
             # stop = stopper(epoch=epoch, fitness=fi)
@@ -439,12 +495,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='yolov5s.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='dataset.yaml path')
-    parser.add_argument('--hyp', type=str, default='data/hyps/hyp.scratch.yaml', help='hyperparameters path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path')
+    parser.add_argument('--cfg', type=str, default='models/resnet.yaml', help='model.yaml path')
+    parser.add_argument('--data', type=str, default='data/multi_room.yaml', help='dataset.yaml path')
+    parser.add_argument('--hyp', type=str, default='data/hyps/hyp.focal.adam.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
+    parser.add_argument('--batch-size', type=int, default=64, help='total batch size for all GPUs')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=32, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
@@ -475,11 +531,15 @@ def parse_opt(known=False):
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--freeze', type=int, default=0, help='Number of layers to freeze. backbone=10, all=24')
-    parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
-    parser.add_argument('--test_env', type=int, default=0)
+    parser.add_argument('--patience', type=int, default=0, help='EarlyStopping patience (epochs without improvement)')
+    parser.add_argument('--test_env', type=int, default=-2)
     parser.add_argument('--ds_seed', type=int, default=0)
     parser.add_argument('--oe-ratio', type=int, default=0)
     parser.add_argument('--leave_out', action='store_true', help='leave-one-domain-out strategy')
+    parser.add_argument('--val-per', type=int, default=1, help='only validate per number of epoch')
+    parser.add_argument('--include', nargs='+',
+                        default=['tb', 'csv'],
+                        help='available loggers are (csv, tb, wandb)')
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
@@ -526,8 +586,9 @@ def main(opt, callbacks=Callbacks()):
             opt1 = deepcopy(opt)
             opt1.test_env = test_env
             opt1.save_dir += f'_{test_env}'
+            callbacks.reset()
 
-            train(opt1.hyp, opt1, device)
+            train(opt1.hyp, opt1, device, callbacks)
             if WORLD_SIZE > 1 and RANK == 0:
                 _ = [print('Destroying process group... ', end=''), dist.destroy_process_group(), print('Done.')]
 
@@ -619,7 +680,7 @@ def main(opt, callbacks=Callbacks()):
               f'Use best hyperparameters example: $ python train.py --hyp {evolve_yaml}')
     
     else:
-        train(opt.hyp, opt, device)
+        train(opt.hyp, opt, device, callbacks)
         if WORLD_SIZE > 1 and RANK == 0:
             _ = [print('Destroying process group... ', end=''), dist.destroy_process_group(), print('Done.')] 
 

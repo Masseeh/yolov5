@@ -12,6 +12,7 @@ import os
 import sys
 from pathlib import Path
 from threading import Thread
+from itertools import chain
 
 import numpy as np
 import torch
@@ -23,15 +24,14 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader, split_dataset
 from utils.general import coco80_to_coco91_class, check_dataset, check_img_size, check_requirements, \
     check_suffix, check_yaml, box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, \
     increment_path, colorstr, print_args
-from utils.metrics import ap_per_class, ConfusionMatrix
+from utils.metrics import ConfusionMatrix, cal_map
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, time_sync
 from utils.callbacks import Callbacks
-
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -103,6 +103,10 @@ def run(data,
         dataloader=None,
         save_dir=Path(''),
         plots=True,
+        ds_seed=0,
+        env_names={},
+        epoch=None,
+        test_env=0,  # test_env
         callbacks=Callbacks(),
         compute_loss=None,
         ):
@@ -121,7 +125,7 @@ def run(data,
         # Load model
         check_suffix(weights, '.pt')
         model = attempt_load(weights, map_location=device)  # load FP32 model
-        gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+        gs = max(int(model.stride.max()), 2)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check image size
 
         # Multi-GPU disabled, incompatible with .half() https://github.com/ultralytics/yolov5/issues/99
@@ -145,21 +149,29 @@ def run(data,
 
     # Dataloader
     if not training:
+
+        in_splits, out_splits, test_splits, _, env_names = split_dataset(data['path'], test_env=test_env, seed=ds_seed, oe_ratio=0)
+        t = {}
+        t['train'] = in_splits
+        t['val'] = out_splits
+        t['test'] = test_splits
+
         if device.type != 'cpu':
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, single_cls, pad=0.5, rect=True,
+        dataloader = create_dataloader(t[task], imgsz, batch_size, gs, single_cls, pad=0.5, rect=False, test_env=test_env, shuffle=False, ds_seed=ds_seed, env_names=env_names,
                                        prefix=colorstr(f'{task}: '))[0]
 
-    seen = 0
+    seen = {v:0 for _, v in env_names.items()}
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
-    s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
-    dt, p, r, f1, mp, mr, map50, map = [0.0, 0.0, 0.0], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    s = ('%20s' * 2 + '%11s' * 6) % ('Env', 'Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
+    dt = [0.0, 0.0, 0.0]
     loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    jdict = []
+    stats = {v:[] for _, v in env_names.items()}
+    for batch_i, (img, targets, paths, shapes, env_idx) in enumerate(tqdm(dataloader, desc=s)):
         t1 = time_sync()
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -190,11 +202,11 @@ def run(data,
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
             path, shape = Path(paths[si]), shapes[si][0]
-            seen += 1
+            seen[env_idx[si]] += 1
 
             if len(pred) == 0:
                 if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                    stats[env_idx[si]].append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
             # Predictions
@@ -213,7 +225,7 @@ def run(data,
                     confusion_matrix.process_batch(predn, labelsn)
             else:
                 correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
+            stats[env_idx[si]].append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
 
             # Save/log
             if save_txt:
@@ -230,26 +242,43 @@ def run(data,
             Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
 
     # Compute statistics
-    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
-        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
-    else:
-        nt = torch.zeros(1)
+    pf = '%20s' * 2 + '%11i' * 2 + '%11.3g' * 4  # print format
+    env_stats = []
+
+    if task != 'test':
+        for _, v in env_names.items():
+            if v == test_env or v == -1:
+                continue
+
+            mp, mr, map50, map, p, r, ap, ap50, ap_class, nt = cal_map(stats=stats[v], plots=plots, save_dir=save_dir, names=names, nc=nc)
+
+            env_stats.extend( [mp, mr, map50, map] )
+
+            # Print results
+            print(pf % (f'env_{v}','all', seen[v], nt.sum(), mp, mr, map50, map))
+
+            # Print results per class
+            if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
+                for i, c in enumerate(ap_class):
+                    print(pf % ('env_{v}', names[c], seen[v], nt[c], p[i], r[i], ap50[i], ap[i]))
+
+    s = list(chain(*[v for v in stats.values()]))
+    mp, mr, map50, map, p, r, ap, ap50, ap_class, nt = cal_map(stats=s, plots=plots, save_dir=save_dir, names=names, nc=nc)
+
+    env_stats.extend( [mp, mr, map50, map] )
+
+    total_seen = sum(seen.values())
 
     # Print results
-    pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    print(pf % ('x', 'all', total_seen, nt.sum(), mp, mr, map50, map))
 
     # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+            print(pf % ('x', names[c], total_seen, nt[c], p[i], r[i], ap50[i], ap[i]))
 
     # Print speeds
-    t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
+    t = tuple(x / total_seen * 1E3 for x in dt)  # speeds per image
     if not training:
         shape = (batch_size, 3, imgsz, imgsz)
         print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
@@ -293,7 +322,8 @@ def run(data,
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    
+    return (*env_stats, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
 
 def parse_opt():
@@ -317,6 +347,9 @@ def parse_opt():
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
+    parser.add_argument('--ds_seed', type=int, default=0)
+    parser.add_argument('--test_env', type=int, default=0)
+
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.save_txt |= opt.save_hybrid
