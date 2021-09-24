@@ -220,8 +220,8 @@ def fuse_conv_and_bn(conv, bn):
 
 def model_info(model, verbose=False, img_size=640):
     # Model information. img_size may be int or list, i.e. img_size=640 or img_size=[640, 320]
-    n_p = sum(x.numel() for x in model.parameters())  # number parameters
-    n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
+    n_p = sum(x.numel() for x in model.parameters()) / 1e6  # number parameters
+    n_g = sum(x.numel() for x in model.parameters() if x.requires_grad) / 1e6  # number gradients
     if verbose:
         print('%5s %40s %9s %12s %20s %10s %10s' % ('layer', 'name', 'gradient', 'parameters', 'shape', 'mu', 'sigma'))
         for i, (name, p) in enumerate(model.named_parameters()):
@@ -239,7 +239,7 @@ def model_info(model, verbose=False, img_size=640):
     except (ImportError, Exception):
         fs = ''
 
-    LOGGER.info(f"Model Summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
+    LOGGER.info(f"Model Summary: {len(list(model.modules()))} layers, {n_p:.2f} parameters(M), {n_g:.2f} gradients(M){fs}")
 
 
 def load_classifier(name='resnet101', n=2):
