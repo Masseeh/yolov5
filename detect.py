@@ -73,7 +73,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
     classify, suffix, suffixes = False, Path(w).suffix.lower(), ['.pt', '.onnx', '.tflite', '.pb', '']
     check_suffix(w, suffixes)  # check weights have acceptable suffix
     pt, onnx, tflite, pb, saved_model = (suffix == x for x in suffixes)  # backend booleans
-    stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
+    stride, names = 2, [f'class{i}' for i in range(1000)]  # assign defaults
     if pt:
         model = attempt_load(weights, map_location=device)  # load FP32 model
         stride = int(model.stride.max())  # model stride
@@ -107,6 +107,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
             input_details = interpreter.get_input_details()  # inputs
             output_details = interpreter.get_output_details()  # outputs
             int8 = input_details[0]['dtype'] == np.uint8  # is TFLite quantized uint8 model
+    
     imgsz = check_img_size(imgsz, s=stride)  # check image size
     ascii = is_ascii(names)  # names are ascii (use PIL for UTF-8)
 
@@ -117,7 +118,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
         dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
         bs = len(dataset)  # batch_size
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
+        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=True)
         bs = 1  # batch_size
     vid_path, vid_writer = [None] * bs, [None] * bs
 
@@ -255,9 +256,9 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model path(s)')
-    parser.add_argument('--source', type=str, default='data/images', help='file/dir/URL/glob, 0 for webcam')
-    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--weights', nargs='+', type=str, default='runs/train/all-rooms/weights/last-int8.tflite', help='model path(s)')
+    parser.add_argument('--source', type=str, default='../../datasets/multi_room/0', help='file/dir/URL/glob, 0 for webcam')
+    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[32], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
     parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
