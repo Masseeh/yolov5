@@ -218,7 +218,7 @@ class TFDetect(keras.layers.Layer):
                 xy /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
                 wh /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
                 y = tf.concat([xy, wh, y[..., 4:]], -1)
-                z.append(tf.reshape(y, [-1, 3 * ny * nx, self.no]))
+                z.append(tf.reshape(y, [-1, self.na * ny * nx, self.no]))
 
         return x if self.training else (tf.concat(z, 1), x)
 
@@ -413,13 +413,15 @@ def run(weights=ROOT / 'yolov5s.pt',  # weights path
     # PyTorch model
     im = torch.zeros((batch_size, 3, *imgsz))  # BCHW image
     model = attempt_load(weights, map_location=torch.device('cpu'), inplace=True, fuse=False)
-    y = model(im)  # inference
+    y0 = model(im)  # inference
     model.info()
 
     # TensorFlow model
     im = tf.zeros((batch_size, *imgsz, 3))  # BHWC image
     tf_model = TFModel(cfg=model.yaml, model=model, nc=model.nc, imgsz=imgsz)
-    y = tf_model.predict(im)  # inference
+    y1 = tf_model.predict(im)  # inference
+
+    assert tuple(y0[0].shape) == y1.shape, f'Ouput should have the same shape {tuple(y0[0].shape)} != {y1.shape}'
 
     # Keras model
     im = keras.Input(shape=(*imgsz, 3), batch_size=None if dynamic else batch_size)
@@ -429,8 +431,8 @@ def run(weights=ROOT / 'yolov5s.pt',  # weights path
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='weights path')
-    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--weights', type=str, default=ROOT / 'runs/train/all-rooms/weights/last.pt', help='weights path')
+    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[24 , 32], help='inference size h,w')
     parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     parser.add_argument('--dynamic', action='store_true', help='dynamic batch size')
     opt = parser.parse_args()
